@@ -143,6 +143,7 @@ export class CarouselEngine {
 	#wheelEndTimer = 0
 	#wheelRestartTimer = 0
 	#wheelIntentTimer = 0
+	#releaseWheelTrack: (() => void) | null = null
 
 	#keyboardRubberbanding = false
 
@@ -192,7 +193,8 @@ export class CarouselEngine {
 		if (!this.#started) return
 
 		if (previous.reducedMotion !== options.reducedMotion) this.#updateReducedMotion()
-		if (previous.keyboard !== options.keyboard) this.#rebind()
+		if (previous.wheel !== options.wheel && !options.wheel) this.#resetWheel()
+		if (previous.keyboard !== options.keyboard || previous.wheel !== options.wheel) this.#rebind()
 		if (!options.draggable && this.#pointer) this.#endPointer(null)
 	}
 
@@ -343,7 +345,12 @@ export class CarouselEngine {
 			listen(viewport, 'pointerdown', this.#onPointerDown)
 			listen(viewport, 'click', this.#onClickCapture, { capture: true })
 			listen(viewport, 'dragstart', this.#onDragStart)
-			listen(viewport, 'wheel', this.#onWheel, { passive: false })
+
+			// Deliberately passive: a non-passive `wheel` listener opts the region out of
+			// WebKit's threaded scrolling, which can stall vertical page scrolling over the
+			// carousel entirely. The non-passive listener that calls `preventDefault` is
+			// attached only once a horizontal gesture is committed. See `#attachWheelTrack`.
+			if (this.#options.wheel) listen(viewport, 'wheel', this.#onWheelDetect, { passive: true })
 		}
 
 		const keyboard = this.#options.keyboard
@@ -354,6 +361,7 @@ export class CarouselEngine {
 		}
 
 		this.#unbind = () => {
+			this.#detachWheelTrack()
 			for (const cleanup of cleanups) cleanup()
 		}
 	}
@@ -664,17 +672,15 @@ export class CarouselEngine {
 
 	// Trackpad and horizontal wheel swipes, which page one slide per gesture.
 
-	#onWheel = (event: WheelEvent) => {
+	// Passive: it only measures deltas to decide an axis, and never calls `preventDefault`.
+	#onWheelDetect = (event: WheelEvent) => {
 		if (!this.#options.wheel || this.#trackWidth === 0) return
+
+		// Already committed: `#onWheelTrack` owns the gesture from here.
+		if (this.#wheelAxis === 'horizontal') return
 
 		const { x, y } = this.#wheelDelta(event)
 		if (x === 0 && y === 0) return
-
-		if (this.#wheelAxis === 'horizontal') {
-			event.preventDefault()
-			if (this.#wheelTracking && x !== 0) this.#trackWheel(event.timeStamp, x)
-			return
-		}
 
 		if (!this.#wheelCanStart) return
 
@@ -697,9 +703,20 @@ export class CarouselEngine {
 
 		if (this.#wheelAccumulatedX < this.#wheelAccumulatedY * WHEEL_HORIZONTAL_DOMINANCE) return
 
-		event.preventDefault()
+		// This one event cannot be prevented, because the listener that saw it is passive.
+		// It is at most WHEEL_INTENT_THRESHOLD pixels of horizontal travel, which is far less
+		// than any browser's swipe-navigation threshold.
 		this.#startWheelGesture()
 		this.#trackWheel(event.timeStamp, x)
+	}
+
+	// Non-passive, and attached only for the length of a committed horizontal gesture.
+	#onWheelTrack = (event: WheelEvent) => {
+		if (this.#wheelAxis !== 'horizontal') return
+		event.preventDefault()
+
+		const { x } = this.#wheelDelta(event)
+		if (this.#wheelTracking && x !== 0) this.#trackWheel(event.timeStamp, x)
 	}
 
 	#wheelDelta(event: WheelEvent) {
@@ -713,6 +730,19 @@ export class CarouselEngine {
 		return { x: event.deltaX, y: event.deltaY }
 	}
 
+	#attachWheelTrack() {
+		const viewport = this.#viewport
+		if (!viewport || this.#releaseWheelTrack) return
+		const listener = this.#onWheelTrack as EventListener
+		viewport.addEventListener('wheel', listener, { passive: false })
+		this.#releaseWheelTrack = () => viewport.removeEventListener('wheel', listener)
+	}
+
+	#detachWheelTrack() {
+		this.#releaseWheelTrack?.()
+		this.#releaseWheelTrack = null
+	}
+
 	#startWheelGesture() {
 		this.#wheelAxis = 'horizontal'
 		this.#wheelCanStart = false
@@ -722,9 +752,11 @@ export class CarouselEngine {
 		window.clearTimeout(this.#wheelIntentTimer)
 		this.#cancelAnimation()
 		this.#tracker.reset()
+		this.#attachWheelTrack()
 
 		this.#wheelEndTimer = window.setTimeout(() => {
 			this.#wheelTracking = false
+			this.#detachWheelTrack()
 			this.#release(
 				'wheel',
 				this.#wheelAnchor,
@@ -760,6 +792,7 @@ export class CarouselEngine {
 
 	#resetWheel() {
 		window.clearTimeout(this.#wheelEndTimer)
+		this.#detachWheelTrack()
 		this.#wheelTracking = false
 		this.#resetWheelIntent()
 	}

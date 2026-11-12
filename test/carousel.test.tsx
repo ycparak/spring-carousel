@@ -43,6 +43,33 @@ function slide(label: string) {
 
 afterEach(cleanup)
 
+function mockLayout(width = 300) {
+	const restore: (() => void)[] = []
+	function define(
+		property: 'clientWidth' | 'offsetWidth' | 'offsetLeft',
+		get: (el: HTMLElement) => number
+	) {
+		const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, property)
+		Object.defineProperty(HTMLElement.prototype, property, {
+			configurable: true,
+			get(this: HTMLElement) {
+				return get(this)
+			},
+		})
+		restore.push(() => {
+			if (descriptor) Object.defineProperty(HTMLElement.prototype, property, descriptor)
+		})
+	}
+	const slideIndex = (el: HTMLElement) =>
+		el.hasAttribute('data-spring-carousel-slide') ? Number(el.id.split('-slide-')[1]) : -1
+	define('clientWidth', el => (el.hasAttribute('data-spring-carousel-track') ? width : 0))
+	define('offsetWidth', el => (slideIndex(el) >= 0 ? width : 0))
+	define('offsetLeft', el => Math.max(slideIndex(el), 0) * width)
+	return () => {
+		for (const undo of restore) undo()
+	}
+}
+
 describe('server rendering', () => {
 	it('renders the starting slide accessible and the rest inert', () => {
 		const html = renderToString(<Example defaultIndex={1} />)
@@ -369,35 +396,6 @@ describe('lifecycle', () => {
 })
 
 describe('dragging', () => {
-	const WIDTH = 300
-
-	function mockLayout(width = WIDTH) {
-		const restore: (() => void)[] = []
-		function define(
-			property: 'clientWidth' | 'offsetWidth' | 'offsetLeft',
-			get: (el: HTMLElement) => number
-		) {
-			const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, property)
-			Object.defineProperty(HTMLElement.prototype, property, {
-				configurable: true,
-				get(this: HTMLElement) {
-					return get(this)
-				},
-			})
-			restore.push(() => {
-				if (descriptor) Object.defineProperty(HTMLElement.prototype, property, descriptor)
-			})
-		}
-		const slideIndex = (el: HTMLElement) =>
-			el.hasAttribute('data-spring-carousel-slide') ? Number(el.id.split('-slide-')[1]) : -1
-		define('clientWidth', el => (el.hasAttribute('data-spring-carousel-track') ? width : 0))
-		define('offsetWidth', el => (slideIndex(el) >= 0 ? width : 0))
-		define('offsetLeft', el => Math.max(slideIndex(el), 0) * width)
-		return () => {
-			for (const undo of restore) undo()
-		}
-	}
-
 	let clock = 0
 
 	/** Dispatches a pointer event at `time` ms, or 500ms after the last one: a slow drag. */
@@ -664,5 +662,168 @@ describe('viewport clipping', () => {
 		// `overflow: clip` clips identically without creating a scroll container.
 		expect(rule).toContain('overflow: clip;')
 		expect(rule).not.toContain('overflow: hidden;')
+	})
+})
+
+describe('wheel listeners', () => {
+	const WIDTH = 300
+
+	/**
+	 * happy-dom does not expose the options a listener was registered with, so the
+	 * registrations are recorded by wrapping `addEventListener` / `removeEventListener`
+	 * and keeping only the ones that are still attached.
+	 */
+	function recordWheelListeners() {
+		type Entry = {
+			target: EventTarget
+			listener: unknown
+			options?: AddEventListenerOptions | boolean
+		}
+		const entries: Entry[] = []
+		const add = HTMLElement.prototype.addEventListener
+		const remove = HTMLElement.prototype.removeEventListener
+
+		HTMLElement.prototype.addEventListener = function (
+			this: HTMLElement,
+			type: string,
+			listener: EventListenerOrEventListenerObject,
+			options?: AddEventListenerOptions | boolean
+		) {
+			if (type === 'wheel') entries.push({ target: this, listener, options })
+			return add.call(this, type, listener, options)
+		} as typeof add
+
+		HTMLElement.prototype.removeEventListener = function (
+			this: HTMLElement,
+			type: string,
+			listener: EventListenerOrEventListenerObject,
+			options?: AddEventListenerOptions | boolean
+		) {
+			if (type === 'wheel') {
+				const index = entries.findIndex(
+					entry => entry.target === this && entry.listener === listener
+				)
+				if (index >= 0) entries.splice(index, 1)
+			}
+			return remove.call(this, type, listener, options)
+		} as typeof remove
+
+		const passive = (entry: Entry) =>
+			typeof entry.options === 'object' && entry.options.passive === true
+
+		// React registers its own delegated `wheel` listener on the render container, so
+		// only the registrations on the viewport itself are interesting here.
+		const onViewport = () =>
+			entries.filter(entry =>
+				(entry.target as HTMLElement).hasAttribute?.('data-spring-carousel-viewport')
+			)
+
+		return {
+			attached: () => onViewport().length,
+			nonPassive: () => onViewport().filter(entry => !passive(entry)).length,
+			restore() {
+				HTMLElement.prototype.addEventListener = add
+				HTMLElement.prototype.removeEventListener = remove
+			},
+		}
+	}
+
+	function wheel(target: Element, deltaX: number, deltaY: number) {
+		fireEvent.wheel(target, { deltaX, deltaY, deltaMode: 0 })
+	}
+
+	function setup(props: RootProps = {}) {
+		const undo = mockLayout(WIDTH)
+		const listeners = recordWheelListeners()
+		const { container, unmount } = render(<Example reducedMotion="always" {...props} />)
+		const viewport = container.querySelector('[data-spring-carousel-viewport]') as HTMLElement
+		return {
+			viewport,
+			listeners,
+			unmount,
+			undo() {
+				listeners.restore()
+				undo()
+			},
+		}
+	}
+
+	it('registers only a passive wheel listener at rest', () => {
+		const { viewport, listeners, undo } = setup()
+
+		expect(listeners.attached()).toBe(1)
+		expect(listeners.nonPassive()).toBe(0)
+
+		// Vertical scrolling over the carousel must never make it non-passive.
+		wheel(viewport, 0, 40)
+		wheel(viewport, 0, 120)
+		expect(listeners.nonPassive()).toBe(0)
+
+		// Neither may horizontal movement below the intent threshold.
+		wheel(viewport, 3, 0)
+		expect(listeners.nonPassive()).toBe(0)
+		undo()
+	})
+
+	it('attaches a non-passive listener for a committed horizontal gesture only', () => {
+		vi.useFakeTimers()
+		const { viewport, listeners, undo } = setup()
+
+		act(() => {
+			wheel(viewport, 20, 0)
+		})
+		expect(listeners.nonPassive()).toBe(1)
+
+		// The gesture ends on its own, and the non-passive listener goes with it.
+		act(() => {
+			vi.advanceTimersByTime(200)
+		})
+		expect(listeners.nonPassive()).toBe(0)
+		expect(listeners.attached()).toBe(1)
+
+		undo()
+		vi.useRealTimers()
+	})
+
+	it('moves the carousel while the committed gesture runs', () => {
+		vi.useFakeTimers()
+		const onIndexChange = vi.fn()
+		const { viewport, undo } = setup({ onIndexChange })
+
+		act(() => {
+			wheel(viewport, 40, 0)
+			wheel(viewport, 400, 0)
+			wheel(viewport, 400, 0)
+			vi.advanceTimersByTime(200)
+		})
+
+		expect(onIndexChange).toHaveBeenCalledWith(1)
+		undo()
+		vi.useRealTimers()
+	})
+
+	it('removes a mid-gesture non-passive listener when the carousel unmounts', () => {
+		vi.useFakeTimers()
+		const { viewport, listeners, unmount, undo } = setup()
+
+		act(() => {
+			wheel(viewport, 20, 0)
+		})
+		expect(listeners.nonPassive()).toBe(1)
+
+		act(() => unmount())
+		expect(listeners.attached()).toBe(0)
+
+		undo()
+		vi.useRealTimers()
+	})
+
+	it('registers nothing when wheel support is off', () => {
+		const { viewport, listeners, undo } = setup({ wheel: false })
+
+		expect(listeners.attached()).toBe(0)
+		wheel(viewport, 40, 0)
+		expect(listeners.attached()).toBe(0)
+		undo()
 	})
 })
