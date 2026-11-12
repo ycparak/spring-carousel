@@ -4,6 +4,7 @@ import { hydrateRoot } from 'react-dom/client'
 import { renderToString } from 'react-dom/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Carousel, type RootProps, useCarousel, useCarouselProgress, useSlide } from '../src'
+import { styles } from '../src/styles'
 
 const ITEMS = [
 	{ id: 'fast', label: 'Fast' },
@@ -649,5 +650,19 @@ describe('dragging', () => {
 		fireEvent.click(button)
 		expect(onClick).toHaveBeenCalledTimes(1)
 		undo()
+	})
+})
+
+describe('viewport clipping', () => {
+	it('clips without becoming a scroll container', () => {
+		const rule = styles.match(/:where\(\[data-spring-carousel-viewport\]\) \{([^}]*)\}/)?.[1]
+
+		// `overflow: hidden` would make the viewport a scroll container. WebKit latches a
+		// wheel gesture to the nearest scroll container under the pointer, and because this
+		// one has no vertical overflow it swallows the gesture instead of chaining to the
+		// document, so vertical trackpad scrolls over the carousel do nothing in Safari.
+		// `overflow: clip` clips identically without creating a scroll container.
+		expect(rule).toContain('overflow: clip;')
+		expect(rule).not.toContain('overflow: hidden;')
 	})
 })

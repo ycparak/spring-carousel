@@ -10,7 +10,7 @@ export const styles = `
 
 :where([data-spring-carousel-viewport]) {
 	position: relative;
-	overflow: hidden;
+	overflow: clip;
 	touch-action: pan-y pinch-zoom;
 	user-select: none;
 	-webkit-user-select: none;

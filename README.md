@@ -183,6 +183,7 @@ To keep an element inside a slide from starting a drag (a range input, a map), g
 
 - Requires React 19.2 or later: it uses `useEffectEvent`, ref cleanups and `<style>` hoisting.
 - Left-to-right layouts only for now. There's no looping or autoplay.
+- Clipping uses `overflow: clip`, so the floor is Safari 16+, Chrome 90+ and Firefox 81+. Unlike `overflow: hidden` it doesn't make the viewport a scroll container, which is what stops Safari swallowing vertical trackpad scrolls over the carousel.
 
 ## License
 
